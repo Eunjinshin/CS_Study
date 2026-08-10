@@ -1,1 +1,119 @@
+# Oracle 기초 - 시퀀스(Sequence) · 트랜잭션(Transaction)
 
+## 1. 시퀀스(Sequence)
+
+자동 증가 숫자를 생성하는 DB 객체. MySQL의 `AUTO_INCREMENT`와 달리 테이블과 별도로 만들고, 필요할 때 값을 꺼내 쓴다.
+
+### 생성
+
+```sql
+CREATE SEQUENCE seq_emp_id
+    START WITH 1
+    INCREMENT BY 1
+    NOCACHE
+    NOCYCLE;
+```
+
+- `START WITH`: 시작값
+- `INCREMENT BY`: 증가폭
+- `CACHE`: 성능을 위해 메모리에 값을 미리 할당(기본 20). 서버 재시작 시 캐시된 값은 버려져서 번호가 중간에 빌 수 있음
+- `NOCYCLE`: 최댓값 도달 시 에러 (`CYCLE`이면 처음부터 순환)
+
+### 사용
+
+```sql
+-- 다음 값 가져오기
+INSERT INTO emp (id, name) VALUES (seq_emp_id.NEXTVAL, '홍길동');
+
+-- 현재 값 조회 (NEXTVAL 최소 1번 호출 후에만 가능)
+SELECT seq_emp_id.CURRVAL FROM dual;
+```
+
+`NEXTVAL`은 호출할 때마다 값이 증가하며, 트랜잭션 커밋/롤백 여부와 무관하게 소모된다 → 롤백해도 번호는 되돌아가지 않음. PK가 중간중간 비는 게 정상.
+
+MyBatis 사용 예:
+```xml
+<selectKey keyProperty="id" resultType="long" order="BEFORE">
+    SELECT seq_emp_id.NEXTVAL FROM dual
+</selectKey>
+```
+
+### 시퀀스를 쓰는 이유
+
+**핵심: 여러 세션이 동시에 채번해도 절대 겹치지 않게, 빠르게 고유 번호를 만들기 위해**
+
+`MAX(id) + 1` 방식으로 직접 채번하면:
+
+```sql
+SELECT MAX(id) + 1 FROM emp;  -- 100 조회
+INSERT INTO emp (id, ...) VALUES (101, ...);
+```
+
+- "조회"와 "삽입" 사이에 시간차가 존재 → 그 틈에 다른 세션이 끼어들면 둘 다 같은 값(100)을 근거로 101을 시도 → PK 중복 에러
+- 이를 막으려고 `SELECT ... FOR UPDATE`로 락을 걸면, 이번엔 뒤 세션이 앞 세션의 트랜잭션이 끝날 때까지 대기해야 함 → 성능 저하
+
+시퀀스는 테이블 데이터를 보지 않는 **독립된 카운터 객체**다. `NEXTVAL` 호출은:
+1. 현재값을 아주 짧게(마이크로초 단위) 잠그고
+2. +1 증가시켜
+3. 즉시 반환 후 잠금 해제
+
+이 연산이 원자적(atomic)이라 동시에 여러 세션이 호출해도 절대 같은 값을 받지 않는다. 또한 값을 미리 캐싱해두므로 `MAX(id)+1`처럼 매번 테이블을 스캔할 필요가 없어 빠르다.
+
+**롤백과의 관계**: 시퀀스는 "혹시 롤백될지 모르니 기다렸다가 확정된 값을 주자"가 아니라, 무조건 다음 번호를 떼어주고 롤백되면 그 번호는 그냥 버려지는 방식이다. 그래서 커밋을 기다릴 필요가 없다 → 락 대기가 거의 없음.
+
+| 방식 | 문제 |
+|---|---|
+| `MAX(id) + 1` | 동시성 문제(중복 PK), 성능 저하, 락 대기 발생 |
+| 애플리케이션에서 UUID/카운터 관리 | 여러 서버 인스턴스 간 동기화 필요, 복잡도 증가 |
+| 시퀀스 | DB 레벨에서 원자적으로 보장, 빠름, 커밋 대기 없음 |
+
+---
+
+## 2. 트랜잭션(Transaction)
+
+여러 SQL 작업을 하나의 논리적 단위로 묶는 것. 전부 성공하거나 전부 실패해야 함(원자성).
+
+### 기본 흐름
+
+```sql
+UPDATE account SET balance = balance - 1000 WHERE id = 'A';
+UPDATE account SET balance = balance + 1000 WHERE id = 'B';
+
+COMMIT;   -- 확정
+-- 또는
+ROLLBACK; -- 취소
+```
+
+Oracle은 DML(INSERT/UPDATE/DELETE) 실행 시 자동으로 트랜잭션이 시작되고, `COMMIT` 전까지는 다른 세션에서 변경 내용이 보이지 않는다. (JDBC는 보통 auto-commit이 켜져 있어서 별도 설정 필요)
+
+### ACID 중 실무에서 자주 부딪히는 것
+
+- **Atomicity(원자성)**: 계좌이체 예시처럼 중간에 실패하면 전부 롤백
+- **Isolation(격리성)**: Oracle 기본 격리수준은 `READ COMMITTED` — 커밋된 데이터만 읽음(Dirty Read 방지). 단, 같은 트랜잭션 내에서도 다시 조회하면 값이 바뀔 수 있음(Non-repeatable Read 가능)
+
+### Spring에서
+
+```java
+@Transactional
+public void transfer(String fromId, String toId, int amount) {
+    accountMapper.withdraw(fromId, amount);
+    accountMapper.deposit(toId, amount);
+}
+```
+
+- 메서드 내 RuntimeException 계열 발생 시 자동 롤백
+- Checked Exception은 기본적으로 롤백 안 됨 → `@Transactional(rollbackFor = Exception.class)` 명시 필요한 경우 많음
+- `SAVEPOINT`로 트랜잭션 내 특정 지점까지만 롤백 가능:
+
+```sql
+SAVEPOINT sp1;
+UPDATE ...
+ROLLBACK TO sp1;
+```
+
+---
+
+## 추가로 파볼 지점
+- 격리수준별 차이 (READ COMMITTED / REPEATABLE READ / SERIALIZABLE)
+- 락(Lock)의 종류
+- 시퀀스 CACHE 옵션과 번호 누락 이슈
